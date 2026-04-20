@@ -1,0 +1,433 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+    <title>XR 高清全屏换脸仪</title>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/face_mesh"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/camera_utils"></script>
+    <script src="https://cdn.jsdelivr.net/npm/delaunator@5.0.0/delaunator.min.js"></script>
+    <style>
+        body { 
+            font-family: -apple-system, sans-serif; 
+            margin: 0; 
+            background: #000; 
+            overflow: hidden; /* 防止滑动 */
+        }
+        
+        /* 核心修复：全屏容器包裹两层画布 */
+        #container { 
+            position: fixed; 
+            top: 0; left: 0; 
+            width: 100vw; height: 100vh; 
+            z-index: 1;
+        }
+        
+        video { display: none; }
+        
+        /* 两层画布必须共享完全一致的样式，使用 cover 铺满全屏不留黑边 */
+        .fullscreen-canvas { 
+            position: absolute; 
+            top: 0; left: 0; 
+            width: 100%; height: 100%; 
+            object-fit: cover; 
+        }
+        
+        #three_canvas { 
+            pointer-events: none; /* 让点击穿透到下层 */
+            z-index: 2;
+        }
+
+        /* 悬浮在底部的操作面板 */
+        .dashboard { 
+            position: fixed; 
+            bottom: 30px; 
+            left: 50%; 
+            transform: translateX(-50%);
+            width: 90%; 
+            max-width: 400px; 
+            padding: 20px; 
+            background: rgba(255, 255, 255, 0.95); /* 半透明玻璃质感 */
+            border-radius: 20px;
+            box-shadow: 0 10px 30px rgba(0,0,0,0.3);
+            text-align: center;
+            z-index: 10;
+        }
+
+        #instruction { font-size: 20px; font-weight: bold; color: #007bff; margin-bottom: 15px; }
+        .task-grid { display: grid; grid-template-columns: 1fr; margin-bottom: 15px; }
+        .task { font-size: 13px; opacity: 0.5; padding: 10px; border: 1px solid #ddd; border-radius: 10px; background: #f9f9f9; transition: 0.3s; }
+        .task.active { opacity: 1; border-color: #007bff; background: #e7f3ff; font-weight: bold; }
+        .task.done { opacity: 1; background: #d4edda; border-color: #28a745; color: #155724; display: none; } /* 扫完后隐藏以腾出空间 */
+
+        button { width: 100%; padding: 15px; font-size: 16px; border-radius: 12px; border: none; font-weight: bold; cursor: pointer; margin-top: 10px; }
+        #start_btn { background: #007bff; color: #fff; margin-top:0; }
+        #view_btn { background: #28a745; color: #fff; display: none; }
+        #swap_btn { background: #8e44ad; color: #fff; display: none; }
+        #reset_btn { background: #dc3545; color: #fff; display: none; }
+        #flip_btn { background: #6c757d; color: #fff; }
+    </style>
+</head>
+<body>
+    <div id="container">
+        <video id="input_video" playsinline></video>
+        <canvas id="output_canvas" class="fullscreen-canvas"></canvas>
+        <canvas id="three_canvas" class="fullscreen-canvas"></canvas>
+    </div>
+
+    <div class="dashboard">
+        <div id="instruction">神经网络加载中...</div>
+        <div class="task-grid">
+            <div class="task" id="t_front">请保持正脸平视屏幕，扫描中...</div>
+        </div>
+        
+        <button id="start_btn" disabled>请稍候...</button>
+        <button id="swap_btn">开启实时换脸 (AR)</button>
+        <button id="double_swap_btn" style="background: #e67e22; color: #fff; display: none;">开启双人互换 (AR)</button>
+        <button id="view_btn">查看 3D 拓扑模型</button>
+        
+        <div style="display: flex; gap: 10px;">
+            <button id="flip_btn">切换镜头</button>
+            <button id="reset_btn">重新扫描</button>
+        </div>
+    </div>
+
+    <script type="module">
+        const videoElement = document.getElementById('input_video');
+        const canvasElement = document.getElementById('output_canvas');
+        const canvasCtx = canvasElement.getContext('2d');
+        const threeCanvas = document.getElementById('three_canvas');
+        
+        const instruction = document.getElementById('instruction');
+        const startBtn = document.getElementById('start_btn');
+        const viewBtn = document.getElementById('view_btn');
+        const swapBtn = document.getElementById('swap_btn');
+        const resetBtn = document.getElementById('reset_btn');
+        const flipBtn = document.getElementById('flip_btn');
+
+        let scanPhase = 'idle', poseStartTime = 0, faceData = null, faceData2 = null, cameraAspect = 1.0;
+        const LOCK_TIME = 1500; 
+        let textures = { front:null };
+
+        let scene3D, camera3D, renderer3D, faceMesh3D, faceMesh3D_2;
+        const doubleSwapBtn = document.getElementById('double_swap_btn');
+
+        function speak(t) {
+            window.speechSynthesis.cancel();
+            const m = new SpeechSynthesisUtterance(t);
+            m.lang = 'zh-CN';
+            window.speechSynthesis.speak(m);
+        }
+
+        const faceMesh = new FaceMesh({locateFile: (f) => `https://cdn.jsdelivr.net/npm/@mediapipe/face_mesh/${f}`});
+        faceMesh.setOptions({ maxNumFaces: 2, refineLandmarks: true, minDetectionConfidence: 0.6, minTrackingConfidence: 0.6 });
+
+        faceMesh.onResults((res) => {
+            const w = videoElement.videoWidth, h = videoElement.videoHeight;
+            if (!w) return;
+            cameraAspect = h / w;
+            
+            // 确保两层画布内部的分辨率比例完全锁定
+            if(canvasElement.width !== w) canvasElement.width = w;
+            if(canvasElement.height !== h) canvasElement.height = h;
+
+            canvasCtx.save();
+            if (currentFacingMode === 'user') {
+                canvasCtx.translate(w, 0); canvasCtx.scale(-1, 1);
+            }
+            canvasCtx.drawImage(res.image, 0, 0, w, h);
+            canvasCtx.restore();
+
+            if (res.multiFaceLandmarks && res.multiFaceLandmarks[0]) {
+                const face = res.multiFaceLandmarks[0];
+                
+                if (scanPhase === 'idle') {
+                    startBtn.disabled = false; startBtn.innerText = "开始扫描提取五官";
+                    instruction.innerText = "请将脸部对准屏幕"; 
+                    return;
+                }
+
+                if (scanPhase === 'front' || scanPhase === 'double_front') {
+                    const needTwo = scanPhase === 'double_front';
+                    if (needTwo && res.multiFaceLandmarks.length < 2) {
+                        instruction.innerText = "请确保画面中有两个人";
+                        poseStartTime = 0;
+                        return;
+                    }
+                    if (!poseStartTime) { poseStartTime = Date.now(); }
+                    const elapsed = Date.now() - poseStartTime;
+                    const remaining = Math.ceil((LOCK_TIME - elapsed) / 1000);
+                    if (remaining > 0) {
+                        instruction.innerText = `正在捕获纹理... ${remaining}`;
+                    } else {
+                        textures.front = captureFrame(res, w, h);
+                        faceData = res.multiFaceLandmarks[0].map(p => ({x:p.x, y:p.y, z:p.z}));
+                        if (needTwo) faceData2 = res.multiFaceLandmarks[1].map(p => ({x:p.x, y:p.y, z:p.z}));
+                        
+                        document.getElementById('t_front').classList.add('done');
+                        scanPhase = 'done'; 
+                        speak("提取完成"); 
+                        instruction.innerText = "提取成功！请选择模式";
+                        
+                        startBtn.style.display = 'none';
+                        swapBtn.style.display = needTwo ? 'none' : 'block';
+                        doubleSwapBtn.style.display = needTwo ? 'block' : 'none';
+                        viewBtn.style.display = needTwo ? 'none' : 'block';
+                        resetBtn.style.display = 'block';
+                    }
+                }
+
+                if ((scanPhase === 'ar_swap' || scanPhase === 'ar_double') && renderer3D) {
+                    res.multiFaceLandmarks.forEach((faceArr, idx) => {
+                        const mesh = idx === 0 ? faceMesh3D : faceMesh3D_2;
+                        if (!mesh) return;
+                        const positions = mesh.geometry.attributes.position.array;
+                        faceArr.forEach((p, i) => {
+                            positions[i * 3] = currentFacingMode === 'user' ? (1 - p.x) * w : p.x * w;
+                            positions[i * 3 + 1] = p.y * h;
+                            positions[i * 3 + 2] = -p.z * w; 
+                        });
+                        mesh.geometry.attributes.position.needsUpdate = true;
+                    });
+                    renderer3D.render(scene3D, camera3D);
+                }
+            } else if (scanPhase === 'ar_swap' && renderer3D) {
+                renderer3D.clear(); // 丢失人脸时清空重影
+            }
+        });
+
+        function captureFrame(res, w, h) {
+            const c = document.createElement('canvas'); c.width = w; c.height = h;
+            const ctx = c.getContext('2d');
+            if (currentFacingMode === 'user') {
+                ctx.translate(w, 0); ctx.scale(-1, 1);
+            }
+            ctx.drawImage(res.image, 0, 0, w, h);
+            return c.toDataURL('image/jpeg', 0.95);
+        }
+
+        let currentFacingMode = 'user';
+        let camera;
+
+        function startCamera() {
+            if (camera) camera.stop();
+            camera = new Camera(videoElement, {
+                onFrame: async () => { await faceMesh.send({image: videoElement}); },
+                width: 1280,
+                height: 720,
+                facingMode: currentFacingMode
+            });
+            camera.start();
+        }
+
+        startCamera();
+
+        startBtn.onclick = () => {
+            const mode = confirm("点击‘确定’进行单人换脸，点击‘取消’进行双人互换扫描") ? 'front' : 'double_front';
+            scanPhase = mode;
+            startBtn.style.display = 'none';
+            flipBtn.style.display = 'none';
+            document.getElementById('t_front').innerText = mode === 'front' ? "请保持正脸平视..." : "请两位保持正脸平视...";
+            document.getElementById('t_front').className = 'task active';
+            speak("请保持不动");
+        };
+
+        flipBtn.onclick = () => {
+            currentFacingMode = currentFacingMode === 'user' ? 'environment' : 'user';
+            startCamera();
+        };
+
+        resetBtn.onclick = () => {
+            scanPhase = 'idle';
+            poseStartTime = 0; faceData = null; faceData2 = null; textures.front = null;
+            document.getElementById('t_front').className = 'task';
+            instruction.innerText = "准备好后点击下方按钮";
+            
+            startBtn.style.display = 'block';
+            startBtn.disabled = false;
+            swapBtn.style.display = 'none';
+            viewBtn.style.display = 'none';
+            resetBtn.style.display = 'none';
+            flipBtn.style.display = 'block';
+            
+            if(renderer3D) renderer3D.clear();
+        };
+
+        function createFaceMesh(data, uvData, textureUrl) {
+            const w = canvasElement.width, h = canvasElement.height;
+            const geo = new THREE.BufferGeometry();
+            const uv = [], pts2d = [];
+            uvData.forEach(p => {
+                uv.push(1 - p.x, 1 - p.y);
+                pts2d.push([p.x, p.y]);
+            });
+            geo.setAttribute('uv', new THREE.Float32BufferAttribute(uv, 2));
+            geo.setIndex(new THREE.BufferAttribute(new Uint32Array(Delaunator.from(pts2d).triangles), 1));
+            geo.setAttribute('position', new THREE.BufferAttribute(new Float32Array(data.length * 3), 3));
+
+            let minX = 1, maxX = 0, minY = 1, maxY = 0;
+            uvData.forEach(p => {
+                if(p.x < minX) minX = p.x; if(p.x > maxX) maxX = p.x;
+                if(p.y < minY) minY = p.y; if(p.y > maxY) maxY = p.y;
+            });
+            const cx = 1 - (minX + maxX) / 2, cy = 1 - (minY + maxY) / 2;
+            const rx = (maxX - minX) * 0.55, ry = (maxY - minY) * 0.55;
+
+            const material = new THREE.ShaderMaterial({
+                uniforms: {
+                    tDiffuse: { value: new THREE.TextureLoader().load(textureUrl) },
+                    center: { value: new THREE.Vector2(cx, cy) },
+                    radius: { value: new THREE.Vector2(rx, ry) }
+                },
+                vertexShader: `varying vec2 vUv; void main() { vUv = uv; gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0); }`,
+                fragmentShader: `uniform sampler2D tDiffuse; uniform vec2 center; uniform vec2 radius; varying vec2 vUv; void main() { vec4 texColor = texture2D(tDiffuse, vUv); vec2 dist = (vUv - center) / radius; float d = length(dist); float alpha = 1.0 - smoothstep(0.98, 1.0, d); gl_FragColor = vec4(texColor.rgb, texColor.a * alpha); }`,
+                transparent: true, side: THREE.DoubleSide
+            });
+            return new THREE.Mesh(geo, material);
+        }
+
+        doubleSwapBtn.onclick = () => {
+            if (!faceData2) return;
+            scanPhase = 'ar_double';
+            doubleSwapBtn.style.display = 'none';
+            if (!renderer3D) renderer3D = new THREE.WebGLRenderer({ canvas: threeCanvas, alpha: true, antialias: true });
+            scene3D = new THREE.Scene();
+            renderer3D.setSize(canvasElement.width, canvasElement.height, false);
+            camera3D = new THREE.OrthographicCamera(0, canvasElement.width, 0, canvasElement.height, -1000, 1000);
+            // 交叉赋予数据：Mesh1 使用 Face2 的纹理，Mesh2 使用 Face1 的纹理
+            faceMesh3D = createFaceMesh(faceData, faceData2, textures.front);
+            faceMesh3D_2 = createFaceMesh(faceData2, faceData, textures.front);
+            scene3D.add(faceMesh3D); scene3D.add(faceMesh3D_2);
+        };
+
+        swapBtn.onclick = () => {
+            if (!faceData || !textures.front) return;
+            scanPhase = 'ar_swap';
+            instruction.innerText = "实时贴合模式 (活动头部查看效果)";
+            swapBtn.style.display = 'none';
+            viewBtn.style.display = 'none';
+
+            const w = canvasElement.width;
+            const h = canvasElement.height;
+
+            if (!renderer3D) {
+                renderer3D = new THREE.WebGLRenderer({ canvas: threeCanvas, alpha: true, antialias: true });
+                scene3D = new THREE.Scene();
+            }
+            
+            // 同步内部渲染分辨率
+            renderer3D.setSize(w, h, false); // 核心修复：false 防止修改 CSS 尺寸，保持其 object-fit 生效
+            
+            // 使用正交相机完美重合 2D 画布的像素坐标系：Left=0, Right=w, Top=0, Bottom=h
+            camera3D = new THREE.OrthographicCamera(0, w, 0, h, -1000, 1000);
+            
+            const geo = new THREE.BufferGeometry();
+            const uv = [], pts2d = [];
+            
+            faceData.forEach(p => {
+                uv.push(1 - p.x, 1 - p.y); // UV 映射锁定在扫描定格时的画面
+                pts2d.push([p.x, p.y]);
+            });
+            
+            geo.setAttribute('uv', new THREE.Float32BufferAttribute(uv, 2));
+            geo.setIndex(new THREE.BufferAttribute(new Uint32Array(Delaunator.from(pts2d).triangles), 1));
+            
+            const pos = new Float32Array(faceData.length * 3);
+            geo.setAttribute('position', new THREE.BufferAttribute(pos, 3));
+
+            // 计算人脸边界框以构建基于距离的透明度遮罩（羽化边缘以自然融合）
+            let minX = 1, maxX = 0, minY = 1, maxY = 0;
+            faceData.forEach(p => {
+                if(p.x < minX) minX = p.x; if(p.x > maxX) maxX = p.x;
+                if(p.y < minY) minY = p.y; if(p.y > maxY) maxY = p.y;
+            });
+            const cx = 1 - (minX + maxX) / 2;
+            const cy = 1 - (minY + maxY) / 2;
+            const rx = (maxX - minX) * 0.55; // 适度扩大半径范围，确保边缘区域（如眉毛、额头）被模型完全覆盖
+            const ry = (maxY - minY) * 0.55;
+
+            const loader = new THREE.TextureLoader();
+            const material = new THREE.ShaderMaterial({
+                uniforms: {
+                    tDiffuse: { value: loader.load(textures.front) },
+                    center: { value: new THREE.Vector2(cx, cy) },
+                    radius: { value: new THREE.Vector2(rx, ry) }
+                },
+                vertexShader: `
+                    varying vec2 vUv;
+                    void main() {
+                        vUv = uv;
+                        gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0);
+                    }
+                `,
+                fragmentShader: `
+                    uniform sampler2D tDiffuse;
+                    uniform vec2 center;
+                    uniform vec2 radius;
+                    varying vec2 vUv;
+                    void main() {
+                        vec4 texColor = texture2D(tDiffuse, vUv);
+                        // 计算当前像素到脸部中心的归一化距离
+                        vec2 dist = (vUv - center) / radius;
+                        float d = length(dist);
+                        // 将羽化区域压缩至最边缘（98%-100%），确保五官和眉毛区域 100% 不透明显示模型脸
+                        float alpha = 1.0 - smoothstep(0.98, 1.0, d);
+                        gl_FragColor = vec4(texColor.rgb, texColor.a * alpha);
+                    }
+                `,
+                transparent: true,
+                side: THREE.DoubleSide
+            });
+
+            if (faceMesh3D) scene3D.remove(faceMesh3D);
+            if (faceMesh3D_2) { scene3D.remove(faceMesh3D_2); faceMesh3D_2 = null; }
+            faceMesh3D = createFaceMesh(faceData, faceData, textures.front);
+            scene3D.add(faceMesh3D);
+        };
+
+        viewBtn.onclick = () => {
+            // 省略原预览逻辑，保持不变...
+            sessionStorage.setItem('faceData', JSON.stringify(faceData));
+            sessionStorage.setItem('textures', JSON.stringify(textures));
+            sessionStorage.setItem('aspect', cameraAspect);
+            const win = window.open('', '_blank');
+            win.document.write(`
+                <html>
+                <head><title>3D 拓扑预览</title><script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"><\/script>
+                <script src="https://cdn.jsdelivr.net/npm/three@0.128.0/examples/js/controls/OrbitControls.js"><\/script>
+                <script src="https://cdn.jsdelivr.net/npm/delaunator@5.0.0/delaunator.min.js"><\/script></head>
+                <body style="margin:0; background:#000;">
+                    <script>
+                        const data = JSON.parse(sessionStorage.getItem('faceData'));
+                        const texs = JSON.parse(sessionStorage.getItem('textures'));
+                        const aspect = parseFloat(sessionStorage.getItem('aspect'));
+                        const scene = new THREE.Scene();
+                        const camera = new THREE.PerspectiveCamera(45, window.innerWidth/window.innerHeight, 0.1, 100);
+                        const renderer = new THREE.WebGLRenderer({antialias:true});
+                        renderer.setSize(window.innerWidth, window.innerHeight);
+                        document.body.appendChild(renderer.domElement);
+                        new THREE.OrbitControls(camera, renderer.domElement);
+                        const geo = new THREE.BufferGeometry();
+                        const pos = [], uv = [], pts2d = [];
+                        data.forEach(p => {
+                            pos.push((0.5-p.x)*3, (0.5-p.y)*3*aspect, -p.z*3);
+                            uv.push(1-p.x, 1-p.y); pts2d.push([p.x, p.y]);
+                        });
+                        geo.setAttribute('position', new THREE.Float32BufferAttribute(pos, 3));
+                        geo.setAttribute('uv', new THREE.Float32BufferAttribute(uv, 2));
+                        geo.setIndex(new THREE.BufferAttribute(new Uint32Array(Delaunator.from(pts2d).triangles), 1));
+                        geo.computeVertexNormals();
+                        const material = new THREE.MeshBasicMaterial({ map: new THREE.TextureLoader().load(texs.front), side: THREE.DoubleSide });
+                        scene.add(new THREE.Mesh(geo, material));
+                        camera.position.z = 2;
+                        function anim() { requestAnimationFrame(anim); renderer.render(scene, camera); }
+                        anim();
+                    <\/script>
+                </body></html>
+            `);
+            win.document.close();
+        };
+    </script>
+</body>
+</html>
