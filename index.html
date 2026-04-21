@@ -83,6 +83,8 @@
         </div>
         
         <button id="start_btn" disabled>请稍候...</button>
+        <button id="upload_btn" style="background: #e67e22; color: #fff;">上传照片扫描</button>
+        <input type="file" id="file_input" accept="image/*" style="display: none;">
         <button id="swap_btn">开启实时换脸 (AR)</button>
         <button id="double_swap_btn" style="background: #e67e22; color: #fff; display: none;">开启双人互换 (AR)</button>
         <button id="view_btn">查看 3D 拓扑模型</button>
@@ -105,6 +107,8 @@
         const swapBtn = document.getElementById('swap_btn');
         const resetBtn = document.getElementById('reset_btn');
         const flipBtn = document.getElementById('flip_btn');
+        const uploadBtn = document.getElementById('upload_btn');
+        const fileInput = document.getElementById('file_input');
 
         let scanPhase = 'idle', poseStartTime = 0, faceData = null, faceData2 = null, cameraAspect = 1.0;
         const LOCK_TIME = 1500; 
@@ -231,6 +235,29 @@
             document.getElementById('t_front').innerText = mode === 'front' ? "请保持正脸平视..." : "请两位保持正脸平视...";
             document.getElementById('t_front').className = 'task active';
             speak("请保持不动");
+        };
+
+        uploadBtn.onclick = () => fileInput.click();
+
+        fileInput.onchange = (e) => {
+            const file = e.target.files[0];
+            if (!file) return;
+            const reader = new FileReader();
+            reader.onload = (ev) => {
+                const img = new Image();
+                img.onload = async () => {
+                    const oldMode = currentFacingMode;
+                    currentFacingMode = 'environment'; // 临时关闭镜像处理上传图
+                    scanPhase = 'front';
+                    poseStartTime = 1; // 触发立即捕获逻辑
+                    if (camera) await camera.stop();
+                    await faceMesh.send({image: img});
+                    currentFacingMode = oldMode;
+                    startCamera(); // 恢复实时相机准备换脸
+                };
+                img.src = ev.target.result;
+            };
+            reader.readAsDataURL(file);
         };
 
         flipBtn.onclick = () => {
